@@ -1,48 +1,32 @@
-from typing import List, Dict, Any, TypedDict
+from typing import TypedDict, Dict, Any
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
-from pathrag.agents.tools import (
-    run_histocartography,
-    run_llava_med_on_image,
-    run_llava_med_on_patch,
-    gpt_reason,
-)
+from pathrag.agents.tools import prepare_and_run
+from pathrag.utils.logging import get_logger
 
 class PathRAGState(TypedDict):
     image_path: str
     question: str
-    is_he: bool
-    patches: List[str]
-    candidates: List[str]
-    final_answer: str
+    mode: str
+    top_k: int
+    result: Dict[str, Any]
 
-def node_detect(state: PathRAGState):
-    info = run_histocartography(state["image_path"])
-    state["is_he"] = bool(info.get("is_he", False))
-    state["patches"] = info.get("patches", []) if state["is_he"] else []
-    return state
+logger = get_logger("pathrag.langgraph")
 
-def node_vlm(state: PathRAGState):
-    q = state["question"]
-    cand = [run_llava_med_on_image(state["image_path"], q)]
-    for p in state["patches"]:
-        cand.append(run_llava_med_on_patch(p, q))
-    state["candidates"] = cand
-    return state
-
-def node_reason(state: PathRAGState):
-    state["final_answer"] = gpt_reason(state["question"], state["candidates"])
+def node_pipeline(state: PathRAGState):
+    logger.info(f"LangGraph node start: {state}")
+    state["result"] = prepare_and_run(
+        image_path=state["image_path"],
+        question=state["question"],
+        top_k=state.get("top_k", 3),
+        mode=state.get("mode", "answer"),
+    )
+    logger.info("LangGraph node end.")
     return state
 
 def build_graph():
     graph = StateGraph(PathRAGState)
-    graph.add_node("detect", node_detect)
-    graph.add_node("vlm", node_vlm)
-    graph.add_node("reason", node_reason)
-
-    graph.add_edge(START, "detect")
-    graph.add_edge("detect", "vlm")
-    graph.add_edge("vlm", "reason")
-    graph.add_edge("reason", END)
-
+    graph.add_node("pathrag", node_pipeline)
+    graph.add_edge(START, "pathrag")
+    graph.add_edge("pathrag", END)
     return graph.compile(checkpointer=MemorySaver())

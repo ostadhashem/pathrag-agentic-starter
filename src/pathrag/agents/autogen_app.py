@@ -1,46 +1,22 @@
 import os
-from typing import List
 from autogen import AssistantAgent, UserProxyAgent, tool
-from pathrag.agents.tools import (
-    run_histocartography,
-    run_llava_med_on_image,
-    run_llava_med_on_patch,
-    gpt_reason,
-)
+from typing import Dict, Any
+from pathrag.agents.tools import prepare_and_run
+from pathrag.utils.logging import get_logger
 
-# Wrap domain tools as AutoGen @tool so the planner can call them.
+logger = get_logger("pathrag.autogen")
 
 @tool
-def histo(image_path: str) -> dict:
-    """Return whether H&E and list of top patches."""
-    return run_histocartography(image_path)
-
-@tool
-def vlm_full(image_path: str, question: str) -> str:
-    """Run VLM on the full image."""
-    return run_llava_med_on_image(image_path, question)
-
-@tool
-def vlm_patch(patch_id: str, question: str) -> str:
-    """Run VLM on a single patch."""
-    return run_llava_med_on_patch(patch_id, question)
-
-@tool
-def reason(question: str, candidates: List[str]) -> str:
-    """Fuse candidates with a text reasoner."""
-    return gpt_reason(question, candidates)
+def pathrag(image_path: str, question: str, mode: str = "answer", top_k: int = 3) -> Dict[str, Any]:
+    return prepare_and_run(image_path=image_path, question=question, mode=mode, top_k=top_k)
 
 def build_agents():
+    logger.info("Building AutoGen planner + user agents")
     planner = AssistantAgent(
         "planner",
         system_message="You plan Path-RAG steps and call tools.",
-        llm_config={
-            "config_list": [
-                {"model": "gpt-4o-mini", "api_key": os.getenv("OPENAI_API_KEY")}
-            ],
-            "temperature": 0
-        },
-        tools=[histo, vlm_full, vlm_patch, reason],
+        llm_config={"config_list":[{"model":"gpt-4o-mini","api_key":os.getenv("OPENAI_API_KEY")}], "temperature":0},
+        tools=[pathrag],
     )
     user = UserProxyAgent("user")
     return user, planner
