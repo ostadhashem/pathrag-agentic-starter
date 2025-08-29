@@ -1,0 +1,6 @@
+langchain==0.2.*
+langgraph==0.2.*
+openai>=1.40.0
+pydantic>=2.7
+python-dotenv>=1.0.1
+pyautogen>=0.2.34
