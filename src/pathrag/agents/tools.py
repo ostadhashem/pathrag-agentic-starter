@@ -117,3 +117,15 @@ def prepare_and_run(image_path: str, question: str, top_k: int = DEFAULT_TOP_K, 
     final = gpt_reason(question, mode, img_ans, patch_ans)
     logger.info("Pipeline done.")
     return {"is_he": info["is_he"], "patches": [p.__dict__ for p in patches], "queries": files, "final_answer": final}
+
+def save_patch_crops(image_path: str, patches, out_dir="patch_crops"):
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    img = Image.open(image_path).convert("RGB")
+    saved = []
+    for i, p in enumerate(patches, 1):
+        x0,y0,x1,y1 = p["bbox"]
+        crop = img.crop((x0,y0,x1,y1))
+        out = Path(out_dir)/f"{Path(image_path).stem}_P{i}.png"
+        crop.save(out)
+        saved.append(str(out))
+    return saved

@@ -8,9 +8,7 @@ A GitHub-ready, minimal starter for building an **agentic architecture** around 
 This repo ships with:
 - A clean Python package layout (`src/`).
 - Mock **tools** that simulate HistoCartography, LLaVA-Med, and a text **reasoner**.
-- Two runnable templates:
-  - `scripts/run_langgraph.py`
-  - `scripts/run_autogen.py`
+
 
 > Swap the mocked tool functions with your real implementations (REST calls or Python libs).
 
@@ -32,7 +30,6 @@ cp src/pathrag/workflows/config/.env.example .env
 
 # 4) Run either template
 python scripts/run_langgraph.py
-python scripts/run_autogen.py
 ```
 
 ### Expected output
