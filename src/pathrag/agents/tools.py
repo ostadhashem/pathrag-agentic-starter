@@ -1,3 +1,16 @@
+"""
+Module: agents.tools
+
+Purpose:
+- Define small typed domain objects (e.g., Patch) used across LangGraph nodes.
+- Provide typed interfaces for tiling, ranking, retrieval, per-patch agents, critique, and final fusion.
+- Keep annotations lazy to avoid import cycles and speed up startup.
+
+Notes:
+- Annotations are postponed (strings). Use typing.get_type_hints(...) if runtime resolution is needed.
+- Prefer clear type hints (List[Patch], Dict[str, Any]) to improve IDE support and team readability.
+- Use @dataclass for compact, maintainable domain models.
+"""
 from __future__ import annotations
 from typing import List, Dict, Any, Iterable, Tuple
 import os, json
@@ -23,97 +36,253 @@ class PatchInfo:
     bbox: Tuple[int, int, int, int]
     nuclei_count: int
 
-def _mock_nuclei_count(img: Image.Image) -> int:
-    w, h = img.size
-    return 10 if (w * h) > 64*64 else 0
+# =========================
+# STAGE 1: TILING + HC RANK
+# =========================
+def tile_image(image_path: str, tile_size: int = 224) -> List[Patch]:
+    """Split the input image into a regular grid of tiles (no GPU required).
 
-def _grid_with_overlap(w: int, h: int, grid: int = GRID_SIZE, overlap: float = OVERLAP):
-    step_x = int(w / grid); step_y = int(h / grid)
-    dx = int(step_x * (1 + overlap)); dy = int(step_y * (1 + overlap))
-    for gy in range(grid):
-        for gx in range(grid):
-            x0 = max(0, gx*step_x - int(step_x*overlap/2))
-            y0 = max(0, gy*step_y - int(step_y*overlap/2))
-            x1 = min(w, x0 + dx); y1 = min(h, y0 + dy)
-            yield (x0,y0,x1,y1)
+    Design:
+      - Keeps IDs deterministic (P0, P1, …) based on scan order.
+      - Does NOT load image pixels here if you already have a tiler upstream; feel free to replace
+        with your WSI tiler (OpenSlide, tifffile) that yields (bbox) without loading full image.
 
-def run_histocartography(image_path: str, top_k: int = DEFAULT_TOP_K) -> Dict[str, Any]:
-    logger.info(f"Histo start: image={image_path}, top_k={top_k}")
-    p = Path(image_path)
-    img = Image.new("RGB", (512, 512)) if not p.exists() else Image.open(p).convert("RGB")
-    nuclei_total = _mock_nuclei_count(img)
-    is_he = nuclei_total >= NUCLEI_THRESHOLD
-    patches: List[PatchInfo] = []
-    for idx, bbox in enumerate(_grid_with_overlap(*img.size)):
-        area = (bbox[2]-bbox[0])*(bbox[3]-bbox[1])
-        nuc = int(area // (64*64))
-        patches.append(PatchInfo(patch_id=f"{p.name}::P{idx}", bbox=bbox, nuclei_count=nuc))
-    patches.sort(key=lambda x: x.nuclei_count, reverse=True)
-    selected = patches[:top_k] if is_he else []
-    logger.info(f"Histo result: is_he={is_he}, selected_patches={len(selected)}")
-    return {"is_he": is_he, "patches": [pi.__dict__ for pi in selected]}
+    Args:
+        image_path: Path to the WSI or large image.
+        tile_size: Width/height of square tiles (pixels).
+        stride: Optional stride; if None, defaults to tile_size (no overlap).
+                Use a smaller stride (< tile_size) to introduce overlap.
 
-def make_llava_query_files(image_path: str, question: str, patch_infos: List[PatchInfo]) -> Dict[str, str]:
-    logger.info(f"Writing LLaVA queries for image={image_path}, patches={len(patch_infos)}")
-    def wjsonl(path: Path, rows):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            for r in rows:
-                f.write(json.dumps(r, ensure_ascii=False)+"\n")
-    qroot = OUTPUT_ROOT / "query"
-    files = {
-        "image_direct": qroot / "image_direct.jsonl",
-        "patch_direct": qroot / "patch_direct.jsonl",
-        "image_description": qroot / "image_description.jsonl",
-        "patch_description": qroot / "patch_description.jsonl",
-    }
-    image_rows_direct = [{"image": image_path, "text": question, "question_id": 0}]
-    image_rows_desc   = [{"image": image_path, "text": "Describe the following image in detail.", "question_id": 0}]
-    patch_rows_direct = [{"image": image_path, "bbox": pi.bbox, "text": question, "question_id": 0} for pi in patch_infos]
-    patch_rows_desc   = [{"image": image_path, "bbox": pi.bbox, "text": "Describe the following image in detail.", "question_id": 0} for pi in patch_infos]
-    wjsonl(files["image_direct"], image_rows_direct)
-    wjsonl(files["image_description"], image_rows_desc)
-    wjsonl(files["patch_direct"], patch_rows_direct)
-    wjsonl(files["patch_description"], patch_rows_desc)
-    return {k: str(v) for k, v in files.items()}
+    Returns:
+        A dense list of Patch with zero scores (to be ranked in the next step).
+    """
+    # TODO (real impl):
+    #   - Use OpenSlide/pyvips/tifffile to stream tiles without loading the full WSI.
+    #   - Compute (W, H) from image metadata; iterate y,x over range(0, H, stride).
+    # MOCK (minimal): return 9 tiles of 224×224 from the top-left quadrant
+    tiles: List[Patch] = []
+    k = 0
+    grid = 3  # 3×3 as a lightweight demo
+    step = tile_size
+    for i in range(grid):
+        for j in range(grid):
+            bbox = (j*step, i*step, j*step + tile_size, i*step + tile_size)
+            tiles.append(Patch(id=f"P{k}", bbox=bbox, score=0.0))
+            k += 1
+    logger.info(f"Tiled image {image_path} into {len(tiles)} patches.")
+    return tiles
 
-def _fusion_prompt_answer(question: str, full: List[str], patches: List[str]) -> str:
-    lines = ["You are a professional pathologist.",
-             f"• Perspective 1 (full): {full[0] if full else ''}"]
-    for i,a in enumerate(patches, start=2): lines.append(f"• Perspective {i} (patch): {a}")
-    lines.append(f"• Question: {question}")
-    return "\\n".join(lines)
 
-def _fusion_prompt_desc(question: str, desc_full: str, desc_patches: List[str]) -> str:
-    lines = ["You are a professional pathologist.",
-             f"• Description of image: {desc_full}"]
-    for i,d in enumerate(desc_patches, start=1): lines.append(f"• Description of patch {i}: {d}")
-    lines.append(f"• Question: {question}")
-    return "\\n".join(lines)
+def histocartography_rank(image_path: str, patches: List[Patch]) -> List[Patch]:
+    """Rank patches by a HistoCartography-derived proxy (e.g., nuclei density).
 
-def gpt_reason(question: str, mode: str, full_outputs: List[str], patch_outputs: List[str]) -> str:
-    logger.info(f"GPT fusion: mode={mode}, full={len(full_outputs)}, patches={len(patch_outputs)}")
-    content = _fusion_prompt_answer(question, full_outputs, patch_outputs) if mode == "answer" \
-              else _fusion_prompt_desc(question, full_outputs[0] if full_outputs else "", patch_outputs)
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return "[mocked GPT] keratinization (example)\\n" + content
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":content}], temperature=0)
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"[mocked due to error: {e}] keratinization (example)"
+    Contract:
+      - SAME length/order as input is NOT required; we return a sorted list (desc by score).
+      - Score meaning: larger == more informative (for H&E).
 
-def prepare_and_run(image_path: str, question: str, top_k: int = DEFAULT_TOP_K, mode: str = "answer") -> Dict[str, Any]:
-    logger.info(f"Pipeline start: image={image_path}, mode={mode}, top_k={top_k}")
-    info = run_histocartography(image_path, top_k=top_k)
-    patches = [PatchInfo(**p) for p in info["patches"]]
-    files = make_llava_query_files(image_path, question, patches)
-    # mock VLM outputs (you can wire real LLaVA-Med later)
-    img_ans = [f"[mock IMAGE-ans] {question}"] if mode == "answer" else [f"[mock IMAGE-desc] image description"]
-    patch_ans = [f"[mock PATCH-{i}] ..." for i,_ in enumerate(patches,1)]
-    final = gpt_reason(question, mode, img_ans, patch_ans)
-    logger.info("Pipeline done.")
-    return {"is_he": info["is_he"], "patches": [p.__dict__ for p in patches], "queries": files, "final_answer": final}
+    Replace this mock with:
+      - Your nuclei segmentation + counting per patch, or
+      - Any HC embedding → importance scorer (e.g., graph centrality).
+
+    Args:
+        image_path: Path to image (used if you crop & analyze pixels here).
+        patches: Dense grid from `tile_image`.
+
+    Returns:
+        New list of Patch with `.score` filled, sorted descending by score.
+    """
+    # TODO (real impl):
+    #   for p in patches:
+    #       crop = read_crop(image_path, p.bbox)
+    #       score = nuclei_count(crop) or nuclei_density(crop)
+    #       out.append(Patch(p.id, p.bbox, float(score)))
+    # MOCK: monotonically decreasing scores
+    ranked: List[Patch] = []
+    for i, p in enumerate(patches):
+        ranked.append(Patch(id=p.id, bbox=p.bbox, score=1.0 - 0.05 * i))
+    ranked.sort(key=lambda q: q.score, reverse=True)
+    logger.info(f"Ranked {len(ranked)} patches by HistoCartography proxy.")
+    return ranked
+
+# ==============================
+# STAGE 2: CHEIF + COMMON PATCH
+# ==============================
+def cheif_rank(image_path: str, patches: List[Patch]) -> List[Patch]:
+    """Rank patches by CHEIF attention (foundation model signal).
+
+    Replace this mock with:
+      - A call to your CHEIF model to produce per-patch attentions/saliency.
+      - Normalize scores to [0,1] if you mix with other sources.
+
+    Returns:
+        List[Patch] sorted descending by attention score.
+    """
+    # TODO (real impl):
+    #   att = cheif_attention(image_path, [p.bbox for p in patches]) -> List[float]
+    #   return sorted([Patch(p.id, p.bbox, att[i]) ...], key=lambda x: x.score, reverse=True)
+    ranked: List[Patch] = []
+    for i, p in enumerate(patches):
+        ranked.append(Patch(id=p.id, bbox=p.bbox, score=1.0 - 0.03 * i))
+    ranked.sort(key=lambda q: q.score, reverse=True)
+    return ranked
+
+
+def common_patches(hc: List[Patch], cheif: List[Patch], top_k: int = 6) -> List[Patch]:
+    """Intersect/merge HC and CHEIF rankings into a consensus Top-K.
+
+    Strategy (simple & effective):
+      1) Take a wider band from each list (e.g., 2×top_k) to avoid missing near-misses.
+      2) Merge by patch.id, accumulate scores from both sources.
+      3) Aggregate scores (mean) → sort desc → take Top-K.
+
+    Notes:
+      - If HC/CHEIF disagree on bbox (shouldn’t if tiling is shared), prefer the first occurrence.
+      - You can switch to rank-based fusion (e.g., Borda count) if score scales differ a lot.
+
+    Args:
+        hc: HC-ranked patches (desc by HC score).
+        cheif: CHEIF-ranked patches (desc by attention).
+        top_k: Output size after fusion.
+
+    Returns:
+        Top-K fused Patch list (desc by aggregated score).
+    """
+    band = top_k * 2
+    by_id: Dict[str, Tuple[Tuple[int,int,int,int], List[float]]] = {}
+
+    def add(lst: List[Patch]):
+        for p in lst[:band]:
+            if p.id not in by_id:
+                by_id[p.id] = (p.bbox, [p.score])
+            else:
+                by_id[p.id][1].append(p.score)
+
+    add(hc)
+    add(cheif)
+
+    fused: List[Patch] = []
+    for pid, (bbox, scores) in by_id.items():
+        avg = sum(scores) / len(scores)   # simple average of available scores
+        fused.append(Patch(id=pid, bbox=bbox, score=avg))
+
+    fused.sort(key=lambda q: q.score, reverse=True)
+    logger.info(f"Fused {len(fused)} patches from HC and CHEIF into Top-{top_k}.")
+    return fused[:top_k]
+
+# ===============================
+# STAGE 3: LABELING + RETRIEVAL
+# ===============================
+def identify_subpathology(image_path: str) -> str:
+    """Predict a coarse tissue/site/sub-pathology label from the image.
+
+    Replace this mock with your actual classifier (e.g., PLIP/CLIP head, UTSW model).
+    Keep the return value SHORT and canonicalized (used as a retrieval query/key).
+
+    Args:
+        image_path: path to the source image (or WSI).
+
+    Returns:
+        A normalized label string (e.g., "squamous_cell_carcinoma").
+    """
+    # TODO (real impl):
+    #   label = plip_or_clip_predict(image_path)
+    #   return normalize(label)
+    return "squamous_cell_carcinoma?"
+
+
+def retrieve_subpath_captions(label: str, top_m: int = 5) -> list[str]:
+    """Fetch top-M textual snippets/captions relevant to the label.
+
+    Replace this mock with your retriever (BiomedCLIP/PLIP embeddings + FAISS).
+    Normalize text (strip, de-dupe) and keep snippets concise.
+
+    Args:
+        label: normalized label from identify_subpathology.
+        top_m: how many captions to return.
+
+    Returns:
+        List of short strings (captions/knowledge to condition later agents).
+    """
+    # TODO (real impl):
+    #   qvec = embed(label)
+    #   results = faiss.search(qvec, top_m)
+    #   return [r.text for r in results]
+    return [f"{label} caption #{i+1}" for i in range(top_m)]
+
+
+# =======================================
+# STAGE 4: ROI + PATCH AGENTS (per patch)
+# =======================================
+def roi_agent_describe(patch: Patch, question: str) -> dict[str, object]:
+    """Return whether the patch is useful and a brief clinical description.
+
+    Replace this mock with a VLM (image) or LLM (text-only) agent.
+    The question is provided so the ROI can tailor its description.
+
+    Returns:
+        {"useful": bool, "description": str}
+    """
+    # TODO (real impl):
+    #   crop = load_crop(patch.bbox)
+    #   text = vlm_describe(crop, question)
+    #   useful = detector_or_rule(text)
+    return {"useful": True, "description": f"ROI {patch.id}: keratin pearls likely."}
+
+
+def patch_agent_contribution(patch: Patch, question: str, full_captions: list[str]) -> str:
+    """Explain how this patch contributes to answering the question.
+
+    Provide one focused sentence (ideal for later fusion).
+    You can include a brief reference to the most relevant caption.
+
+    Returns:
+        A short string (<= 1–2 lines).
+    """
+    # TODO (real impl):
+    #   crop = load_crop(patch.bbox)
+    #   return vlm_or_llm_contribution(crop, question, full_captions)
+    cap = full_captions[0] if full_captions else "domain context"
+    return f"{patch.id} supports the answer via {cap}."
+
+# =====================================
+# STAGE 6: QUESTION-AWARE RE-RANK TOPK
+# =====================================
+def rerank_for_question(
+    patches: list[Patch],
+    summaries: list[str],
+    question: str,
+    k: int,
+) -> list[int]:
+    """Return indices (into `patches`) for the Top-K most relevant summaries.
+
+    Replace this mock with:
+      - Embedding similarity (question vs summary), or
+      - A cross-encoder scoring model.
+
+    NOTE: Return INDICES (ints), not Patch objects, to avoid state duplication.
+    """
+    # TODO (real impl):
+    #   scores = cross_encoder(question, summaries)
+    #   idx = sorted(range(len(summaries)), key=lambda i: scores[i], reverse=True)[:k]
+    return list(range(min(k, len(patches))))
+
+# ============================
+# STAGE 7: FINAL FUSION (LLM)
+# ============================
+def fuse_answer(
+    question: str,
+    label: str,
+    chosen: list[tuple[Patch, str]],
+    mode: str = "answer",     # "answer" | "description"
+) -> str:
+    """Fuse per-patch statements + label into the final answer.
+
+    Replace this with a GPT-class call if OPENAI_API_KEY is set.
+    Keep the output short and evidence-grounded.
+
+    Args:
+        chosen: list of (Patch, summary) for Top-K after re-ranking.
+    """
+    # TODO (real impl): construct a careful prompt; include 1–2 safety rules.
+    bullets = "\n".join([f"- {p.id} → {s}" for p, s in chosen])
+    return f"[mock {mode}] Q: {question}\nlabel={label}\n{bullets}"
