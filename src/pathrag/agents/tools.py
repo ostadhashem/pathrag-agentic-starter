@@ -19,6 +19,15 @@ from pathlib import Path
 from PIL import Image
 from dotenv import load_dotenv
 from pathrag.utils.logging import get_logger
+
+from pathrag.siteid_client import predict_tissue
+from pathrag.retrieval.store import captions_for_label
+
+import os, json
+from pathlib import Path
+from pathrag.vision.crop import save_crops
+from pathrag.vlm.llava_med_client import LlavaMedClient
+
 load_dotenv()
 logger = get_logger("pathrag.tools")
 
@@ -35,6 +44,15 @@ class PatchInfo:
     patch_id: str
     bbox: Tuple[int, int, int, int]
     nuclei_count: int
+
+
+# Lightweight Patch dataclass used throughout the graph. Kept minimal so callers
+# can construct via Patch(**p) when p is a dict coming from state.
+@dataclass
+class Patch:
+    id: str
+    bbox: Tuple[int, int, int, int]
+    score: float = 0.0
 
 # =========================
 # STAGE 1: TILING + HC RANK
@@ -184,10 +202,7 @@ def identify_subpathology(image_path: str) -> str:
     Returns:
         A normalized label string (e.g., "squamous_cell_carcinoma").
     """
-    # TODO (real impl):
-    #   label = plip_or_clip_predict(image_path)
-    #   return normalize(label)
-    return "squamous_cell_carcinoma?"
+    return predict_tissue(image_path)["label"]  # TODO (real impl):
 
 
 def retrieve_subpath_captions(label: str, top_m: int = 5) -> list[str]:
@@ -203,31 +218,65 @@ def retrieve_subpath_captions(label: str, top_m: int = 5) -> list[str]:
     Returns:
         List of short strings (captions/knowledge to condition later agents).
     """
-    # TODO (real impl):
-    #   qvec = embed(label)
-    #   results = faiss.search(qvec, top_m)
-    #   return [r.text for r in results]
-    return [f"{label} caption #{i+1}" for i in range(top_m)]
+    return captions_for_label(label, top_m=top_m)    # TODO (real impl):
 
 
 # =======================================
 # STAGE 4: ROI + PATCH AGENTS (per patch)
 # =======================================
-def roi_agent_describe(patch: Patch, question: str) -> dict[str, object]:
-    """Return whether the patch is useful and a brief clinical description.
+def _write_jsonl(rows, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    Replace this mock with a VLM (image) or LLM (text-only) agent.
-    The question is provided so the ROI can tailor its description.
+def _rows_for_patches(patch_image_paths, prompt):
+    # LLaVA expects: {"image": "<file>", "text": "<prompt>", "question_id": i}
+    rows = []
+    for i, img in enumerate(patch_image_paths):
+        rows.append({"image": img, "text": prompt, "question_id": i})
+    return rows
 
-    Returns:
-        {"useful": bool, "description": str}
+def roi_agent_describe(patch, question: str):
     """
-    # TODO (real impl):
-    #   crop = load_crop(patch.bbox)
-    #   text = vlm_describe(crop, question)
-    #   useful = detector_or_rule(text)
-    return {"useful": True, "description": f"ROI {patch.id}: keratin pearls likely."}
+    REAL VLM call (LLaVA-Med): single-patch ROI description.
+    Requires:
+      - PATHRAG_IMAGE: path to the full image (or defaults to sample_he.png)
+      - LLMED_REPO, LLMED_MODEL: see client
+    """
+    img_path = os.environ.get("PATHRAG_IMAGE", "sample_he.png")
+    crop_paths = save_crops(img_path, [patch.bbox], "artifacts/crops")
+    prompt = f"Briefly describe this pathology ROI to help answer: {question}. One sentence."
+    qfile = "artifacts/query/roi.jsonl"
+    afile = "artifacts/answer/roi.jsonl"
+    _write_jsonl(_rows_for_patches(crop_paths, prompt), qfile)
 
+    try:
+        client = LlavaMedClient()
+        texts = client.ask_batch(qfile, ".", afile)
+        text = texts[0] if texts else f"[roi-fallback] {patch.id}"
+        return {"useful": True, "description": text}
+    except Exception as e:
+        return {"useful": True, "description": f"[roi-error] {e}"}
+
+def patch_agent_contribution(patch, question: str, full_captions: list[str]):
+    """
+    REAL VLM call (LLaVA-Med): explain contribution of this ROI to the answer.
+    """
+    img_path = os.environ.get("PATHRAG_IMAGE", "sample_he.png")
+    crop_paths = save_crops(img_path, [patch.bbox], "artifacts/crops")
+    cap = full_captions[0] if full_captions else "general pathology context"
+    prompt = f"In ONE sentence, explain how this ROI helps answer: '{question}'. Use this context: {cap}"
+    qfile = "artifacts/query/patch.jsonl"
+    afile = "artifacts/answer/patch.jsonl"
+    _write_jsonl(_rows_for_patches(crop_paths, prompt), qfile)
+
+    try:
+        client = LlavaMedClient()
+        texts = client.ask_batch(qfile, ".", afile)
+        return texts[0] if texts else f"[patch-fallback] {patch.id} via {cap}"
+    except Exception as e:
+        return f"[patch-error] {e}"
 
 def patch_agent_contribution(patch: Patch, question: str, full_captions: list[str]) -> str:
     """Explain how this patch contributes to answering the question.
@@ -265,6 +314,21 @@ def rerank_for_question(
     #   scores = cross_encoder(question, summaries)
     #   idx = sorted(range(len(summaries)), key=lambda i: scores[i], reverse=True)[:k]
     return list(range(min(k, len(patches))))
+
+
+# ==========================
+# Stage 5 helper (mock)
+# ==========================
+def critique_round(summaries: List[str], roi_desc: List[str], question: str, round_ix: int) -> List[str]:
+    """Apply a single mock critique pass over patch summaries.
+
+    This placeholder simply appends the round index to each summary. Replace
+    with a real critique agent (LLM) if/when available.
+    """
+    out: List[str] = []
+    for s in summaries:
+        out.append(f"{s} [critique_round={round_ix}]")
+    return out
 
 # ============================
 # STAGE 7: FINAL FUSION (LLM)
