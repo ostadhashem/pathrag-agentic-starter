@@ -25,3 +25,7 @@ venv/
 
 tools/llava_med/.venv/
 tools/llava_med/artifacts/
+artifacts/
+data/
+!data/.gitkeep
+logs/

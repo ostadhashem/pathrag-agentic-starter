@@ -26,6 +26,9 @@ from __future__ import annotations
 from typing import TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
+# at top with others
+from pathrag.agents.nodes.stage4_llava_reader import stage4_llava_reader
+
 
 # Domain tools (stage implementations; currently mocked in tools.py)
 from pathrag.agents.tools import (
@@ -263,7 +266,7 @@ def build_graph():
     # Register nodes
     g.add_node("tile_rank", n_tile_and_rank)           # Stages 1–2
     g.add_node("identify", n_identify_and_retrieve)    # Stage 3
-    g.add_node("roi_patch", n_roi_and_patch_agents)    # Stage 4
+    g.add_node("stage4", stage4_llava_reader)  # stage3 -> stage4 -> stage5
     g.add_node("critique", n_critique_round)           # Stage 5 (loop)
     g.add_node("rerank", n_rerank_and_choose)          # Stage 6
     g.add_node("fuse", n_fuse)                         # Stage 7

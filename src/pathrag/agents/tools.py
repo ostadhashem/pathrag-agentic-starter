@@ -20,7 +20,7 @@ from PIL import Image
 from dotenv import load_dotenv
 from pathrag.utils.logging import get_logger
 
-from pathrag.siteid_client import predict_tissue
+from pathrag.site_labeler import predict_tissue
 from pathrag.retrieval.store import captions_for_label
 
 import os, json
@@ -39,11 +39,35 @@ DEFAULT_TOP_K = 3
 OUTPUT_ROOT = Path(os.getenv("OUTPUT_ROOT", "src/pathrag/pipeline/files"))
 (OUTPUT_ROOT / "query").mkdir(parents=True, exist_ok=True)
 
-@dataclass
-class PatchInfo:
-    patch_id: str
-    bbox: Tuple[int, int, int, int]
-    nuclei_count: int
+import subprocess
+from pathlib import Path
+
+def _run_medgemma(question: str, captions: list[str], tool_dir: str | None = None) -> str:
+    tool = Path(tool_dir or os.environ.get("MEDGEMMA_TOOL_DIR", "tools/medgemma")).resolve()
+    py   = tool / ".venv/bin/python"
+    cfg  = tool / "config/default.yaml"
+    out  = tool / "artifacts/answer/out.json"
+
+    if not py.exists():
+        raise RuntimeError(f"MedGemma tool not found: {py}\nSet MEDGEMMA_TOOL_DIR or install the tool venv.")
+
+    # write a temp captions file next to the tool (no cross-env imports)
+    tmp = tool / "data" / "captions_from_graph.json"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(captions), encoding="utf-8")
+
+    cmd = [
+        str(py), "-m", "src.graph.medgemma_run",
+        "--config", str(cfg),
+        "--question", question,
+        "--captions-file", str(tmp),
+        "--out", str(out),
+        "--k", str(min(len(captions), 6)),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(tool))
+    if r.returncode != 0:
+        raise RuntimeError(f"[MedGemma failed]\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}")
+    return json.loads(out.read_text()).get("answer", "").strip()
 
 
 # Lightweight Patch dataclass used throughout the graph. Kept minimal so callers
@@ -339,14 +363,11 @@ def fuse_answer(
     chosen: list[tuple[Patch, str]],
     mode: str = "answer",     # "answer" | "description"
 ) -> str:
-    """Fuse per-patch statements + label into the final answer.
-
-    Replace this with a GPT-class call if OPENAI_API_KEY is set.
-    Keep the output short and evidence-grounded.
-
-    Args:
-        chosen: list of (Patch, summary) for Top-K after re-ranking.
-    """
-    # TODO (real impl): construct a careful prompt; include 1–2 safety rules.
-    bullets = "\n".join([f"- {p.id} → {s}" for p, s in chosen])
-    return f"[mock {mode}] Q: {question}\nlabel={label}\n{bullets}"
+    # Extract short inputs for the text LLM: label + per-patch summaries
+    captions = [f"{label}: {s}" for _, s in chosen]
+    try:
+        return _run_medgemma(question, captions)
+    except Exception as e:
+        # fallback to the existing mock if MedGemma tool isn’t available
+        bullets = "\n".join([f"- {p.id} → {s}" for p, s in chosen])
+        return f"[mock {mode}] Q: {question}\nlabel={label}\n{bullets}\n{e}"
