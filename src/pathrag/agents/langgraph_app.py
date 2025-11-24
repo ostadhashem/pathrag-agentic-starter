@@ -274,8 +274,8 @@ def build_graph():
     # Wire edges
     g.add_edge(START, "tile_rank")
     g.add_edge("tile_rank", "identify")
-    g.add_edge("identify", "roi_patch")
-    g.add_edge("roi_patch", "critique")
+    g.add_edge("identify", "stage4")
+    g.add_edge("stage4", "critique")
 
     # Loop: critique → (critique | rerank)
     g.add_conditional_edges(

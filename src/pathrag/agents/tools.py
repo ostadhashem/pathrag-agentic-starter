@@ -341,18 +341,138 @@ def rerank_for_question(
 
 
 # ==========================
-# Stage 5 helper (mock)
+# Stage 5 
 # ==========================
-def critique_round(summaries: List[str], roi_desc: List[str], question: str, round_ix: int) -> List[str]:
-    """Apply a single mock critique pass over patch summaries.
 
-    This placeholder simply appends the round index to each summary. Replace
-    with a real critique agent (LLM) if/when available.
+from typing import List
+import math
+
+
+def _simple_overlap_score(question: str, text: str) -> float:
     """
-    out: List[str] = []
-    for s in summaries:
-        out.append(f"{s} [critique_round={round_ix}]")
-    return out
+    Tiny lexical overlap score between question and text.
+    Just to have *some* critique signal without calling an LLM.
+    """
+    if not question or not text:
+        return 0.0
+
+    q_tokens = {t.lower() for t in question.split() if len(t) > 2}
+    t_tokens = {t.lower() for t in text.split() if len(t) > 2}
+    if not q_tokens or not t_tokens:
+        return 0.0
+
+    inter = len(q_tokens & t_tokens)
+    return inter / math.sqrt(len(q_tokens) * len(t_tokens))
+
+
+def critique_round(
+    patch_summaries: List[str],
+    roi_desc: List[str],
+    question: str,
+    round_ix: int,
+) -> List[str]:
+    """
+    Stage 5: one critique pass over patch_summaries.
+
+    Inputs
+    ------
+    patch_summaries : list[str]
+        Per-patch summaries from Stage-4 (aligned to patches).
+    roi_desc : list[str]
+        Per-patch ROI descriptions (same length as patch_summaries).
+    question : str
+        Original VQA question.
+    round_ix : int
+        Current critique round index (0-based). Can be used to make
+        later rounds more aggressive, if desired.
+
+    Output
+    ------
+    list[str]
+        Refined summaries, still one string per patch. We keep it
+        backward-compatible so Stage-6 (rerank_for_question) can
+        treat them as plain text, but we add lightweight tags like:
+
+        - "[OFF_TOPIC]"   for clearly irrelevant patches
+        - "[CENTRAL]" / "[SUPPORTING]" hints when possible
+    """
+    refined: List[str] = []
+
+    # Safety: align lengths
+    n = min(len(patch_summaries), len(roi_desc)) if roi_desc else len(patch_summaries)
+
+    for i in range(n):
+        base = patch_summaries[i] or ""
+        roi = roi_desc[i] if i < len(roi_desc) else ""
+
+        overlap = _simple_overlap_score(question, base + " " + roi)
+
+        # Heuristic flags
+        if overlap < 0.05:
+            role = "OFF_TOPIC"
+        elif overlap > 0.25:
+            # treat the most question-aligned patches as more central
+            role = "CENTRAL" if overlap > 0.40 else "SUPPORTING"
+        else:
+            role = "UNCERTAIN"
+
+        # Round-aware hint: later rounds could be stricter. For now,
+        # we just annotate the round for debugging.
+        header = f"[ROUND={round_ix}] [{role}] [PATCH={i}]"
+
+        # Compact refinement: keep question-relevant language, drop fluff
+        # We don't try to be too smart here—this is just a structured
+        # summary wrapper that Stage-6 can use.
+        merged_context = base.strip()
+        if roi:
+            merged_context = f"{merged_context} (ROI: {roi.strip()})".strip()
+
+        refined_text = f"{header} {merged_context}"
+        refined.append(refined_text)
+
+    # If roi_desc is shorter than patch_summaries, keep the tail as-is
+    for j in range(n, len(patch_summaries)):
+        refined.append(patch_summaries[j])
+
+    return refined
+
+
+def _llm_critique_single(
+    question: str, roi: str, summary: str, role_hint: str, round_ix: int
+) -> str:
+    """
+    Wraps an LLM call that rewrites the patch summary.
+
+    Return: a single line of text including tags like [CENTRAL]/[OFF_TOPIC]
+    so Stage-6 can still parse it as plain text.
+    """
+    # Pseudocode — wire to your actual client
+    prompt = f"""
+    You are a pathology VQA critique agent.
+
+    Question: {question}
+
+    ROI description:
+    {roi}
+
+    Patch summary:
+    {summary}
+
+    Role hint: {role_hint}
+    Round: {round_ix}
+
+    1. Decide whether this patch is CENTRAL, SUPPORTING, or OFF_TOPIC
+       for answering the question.
+    2. Rewrite the patch summary in at most 2 sentences, focusing only on
+       details relevant to answering the question.
+    3. Start your answer with a tag in square brackets, one of
+       [CENTRAL], [SUPPORTING], or [OFF_TOPIC].
+
+    Return ONLY a single line of text.
+    """
+    # response = client.responses.create(...)
+    # return response.output[0].content[0].text
+    raise NotImplementedError("Hook up LLM here")
 
 # ============================
 # STAGE 7: FINAL FUSION (LLM)
