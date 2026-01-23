@@ -302,7 +302,7 @@ def patch_agent_contribution(patch, question: str, full_captions: list[str]):
     except Exception as e:
         return f"[patch-error] {e}"
 
-def patch_agent_contribution(patch: Patch, question: str, full_captions: list[str]) -> str:
+# def patch_agent_contribution(patch: Patch, question: str, full_captions: list[str]) -> str:
     """Explain how this patch contributes to answering the question.
 
     Provide one focused sentence (ideal for later fusion).
@@ -364,6 +364,79 @@ def _simple_overlap_score(question: str, text: str) -> float:
     inter = len(q_tokens & t_tokens)
     return inter / math.sqrt(len(q_tokens) * len(t_tokens))
 
+import re
+
+def _build_gemmamed_critique_prompt(
+    question: str,
+    patch_summaries: List[str],
+    roi_desc: List[str],
+    round_ix: int,
+) -> str:
+    """
+    Build a single batched prompt for GemmaMed.
+    GemmaMed should return one line per patch, e.g.:
+
+        [PATCH=0] [CENTRAL] Rewritten summary...
+
+    We keep it text-only so you can hook it to HF/vLLM/your own server.
+    """
+    blocks = []
+    for i, base in enumerate(patch_summaries):
+        roi = roi_desc[i] if i < len(roi_desc) else ""
+        blocks.append(
+            f"Patch {i}:\n"
+            f"Summary: {base or '[empty]'}\n"
+            f"ROI: {roi or 'N/A'}"
+        )
+
+    patches_block = "\n\n".join(blocks)
+
+    prompt = f"""
+You are GemmaMed, a careful pathology VQA assistant.
+
+We are in critique round {round_ix}.
+
+Task:
+For EACH patch, you must:
+1. Decide if the patch is:
+   - CENTRAL: crucial to answer the question.
+   - SUPPORTING: helpful but not the main evidence.
+   - OFF_TOPIC: mostly irrelevant.
+   - CONTRADICTORY: conflicts with the likely correct answer.
+2. Rewrite the patch summary in at most 2 sentences, focusing ONLY on details
+   relevant to answering the question.
+
+Output format:
+Return EXACTLY ONE line per patch, with:
+
+  [PATCH=i] [ROLE] rewritten-summary-here
+
+where ROLE is CENTRAL, SUPPORTING, OFF_TOPIC, or CONTRADICTORY.
+
+Do NOT include any extra commentary.
+
+Question:
+{question}
+
+Patches:
+{patches_block}
+"""
+    return prompt.strip()
+
+
+def _call_gemmamed_for_critique(prompt: str) -> str:
+    """
+    Hook this into your actual GemmaMed model.
+
+    Examples:
+      - HF Inference API
+      - vLLM server
+      - Local medgemma_run.py with a different mode
+
+    For now, it's a stub you need to implement.
+    """
+    raise NotImplementedError("Wire this to your GemmaMed deployment for Stage 5.")
+
 
 def critique_round(
     patch_summaries: List[str],
@@ -374,55 +447,68 @@ def critique_round(
     """
     Stage 5: one critique pass over patch_summaries.
 
-    Inputs
-    ------
-    patch_summaries : list[str]
-        Per-patch summaries from Stage-4 (aligned to patches).
-    roi_desc : list[str]
-        Per-patch ROI descriptions (same length as patch_summaries).
-    question : str
-        Original VQA question.
-    round_ix : int
-        Current critique round index (0-based). Can be used to make
-        later rounds more aggressive, if desired.
+    Preferred path:
+      - Use GemmaMed (via _call_gemmamed_for_critique) to classify each patch
+        (CENTRAL/SUPPORTING/OFF_TOPIC/CONTRADICTORY) and rewrite the summary.
 
-    Output
-    ------
-    list[str]
-        Refined summaries, still one string per patch. We keep it
-        backward-compatible so Stage-6 (rerank_for_question) can
-        treat them as plain text, but we add lightweight tags like:
+    Fallback:
+      - If GemmaMed is not configured or errors, fall back to the simple lexical
+        heuristic using _simple_overlap_score, preserving the old behavior.
 
-        - "[OFF_TOPIC]"   for clearly irrelevant patches
-        - "[CENTRAL]" / "[SUPPORTING]" hints when possible
+    Returns:
+      list[str] of the SAME length as patch_summaries, but with enriched tags:
+        [ROUND=r] [ROLE] [PATCH=i] rewritten summary...
     """
+    if not patch_summaries:
+        return []
+
+    # Try GemmaMed first
+    try:
+        prompt = _build_gemmamed_critique_prompt(
+            question=question,
+            patch_summaries=patch_summaries,
+            roi_desc=roi_desc,
+            round_ix=round_ix,
+        )
+        raw = _call_gemmamed_for_critique(prompt)
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+        refined = list(patch_summaries)  # default to originals
+        pattern = re.compile(r"\[PATCH=(\d+)\]\s*\[(\w+)\]\s*(.*)")
+
+        for ln in lines:
+            m = pattern.match(ln)
+            if not m:
+                continue
+            idx = int(m.group(1))
+            role = m.group(2)
+            body = m.group(3).strip()
+            if 0 <= idx < len(refined):
+                refined[idx] = f"[ROUND={round_ix}] [{role}] [PATCH={idx}] {body}"
+
+        return refined
+
+    except Exception as e:
+        logger.warning(f"GemmaMed critique failed, falling back to heuristic: {e}")
+
+    # ---------- Fallback: old heuristic behavior ----------
     refined: List[str] = []
 
-    # Safety: align lengths
     n = min(len(patch_summaries), len(roi_desc)) if roi_desc else len(patch_summaries)
-
     for i in range(n):
         base = patch_summaries[i] or ""
         roi = roi_desc[i] if i < len(roi_desc) else ""
 
         overlap = _simple_overlap_score(question, base + " " + roi)
 
-        # Heuristic flags
         if overlap < 0.05:
             role = "OFF_TOPIC"
         elif overlap > 0.25:
-            # treat the most question-aligned patches as more central
             role = "CENTRAL" if overlap > 0.40 else "SUPPORTING"
         else:
             role = "UNCERTAIN"
 
-        # Round-aware hint: later rounds could be stricter. For now,
-        # we just annotate the round for debugging.
         header = f"[ROUND={round_ix}] [{role}] [PATCH={i}]"
-
-        # Compact refinement: keep question-relevant language, drop fluff
-        # We don't try to be too smart here—this is just a structured
-        # summary wrapper that Stage-6 can use.
         merged_context = base.strip()
         if roi:
             merged_context = f"{merged_context} (ROI: {roi.strip()})".strip()
@@ -430,12 +516,10 @@ def critique_round(
         refined_text = f"{header} {merged_context}"
         refined.append(refined_text)
 
-    # If roi_desc is shorter than patch_summaries, keep the tail as-is
     for j in range(n, len(patch_summaries)):
         refined.append(patch_summaries[j])
 
     return refined
-
 
 def _llm_critique_single(
     question: str, roi: str, summary: str, role_hint: str, round_ix: int
